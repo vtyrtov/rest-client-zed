@@ -11,6 +11,8 @@ mod security;
 mod variables;
 
 use std::sync::Arc;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -187,9 +189,35 @@ impl LanguageServer for RestClientLsp {
 
                     if let Ok(uri) = Url::parse(uri_str) {
                         match handler::execute_request(&uri, line, &self.state).await {
-                            Ok(response) => {
-                                self.show_response(&response).await;
-                                return Ok(Some(Value::String(response)));
+                            Ok(output) => {
+                                match self
+                                    .show_response(
+                                        &uri,
+                                        &output.file_content,
+                                        output.request_content_type.as_deref(),
+                                    )
+                                    .await
+                                {
+                                    Ok(path) => {
+                                        self.client
+                                            .show_message(
+                                                MessageType::INFO,
+                                                format!("Request completed. Response saved to {path}"),
+                                            )
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        self.client
+                                            .show_message(
+                                                MessageType::WARNING,
+                                                format!(
+                                                    "Request completed, but response file could not be saved: {e}"
+                                                ),
+                                            )
+                                            .await;
+                                    }
+                                }
+                                return Ok(Some(Value::String(output.formatted_response)));
                             }
                             Err(e) => {
                                 self.client
@@ -226,19 +254,101 @@ impl LanguageServer for RestClientLsp {
 }
 
 impl RestClientLsp {
-    async fn show_response(&self, response: &str) {
-        let dir = std::env::temp_dir().join("rest-client-zed");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("response.http");
-        let _ = std::fs::write(&path, response);
+    async fn show_response(
+        &self,
+        source_uri: &Url,
+        response: &str,
+        request_content_type: Option<&str>,
+    ) -> std::result::Result<String, String> {
+        let path = self.response_output_path(source_uri, request_content_type)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create response dir: {e}"))?;
+        }
+        std::fs::write(&path, response).map_err(|e| format!("write response: {e}"))?;
 
-        // Zed doesn't support window/showDocument for extensions.
-        // Spawn `zed --add` to open the response file in the current workspace.
-        // Zed reuses the tab if the same absolute path is already open.
-        let _ = std::process::Command::new("zed")
-            .arg("--add")
-            .arg(&path)
-            .spawn();
+        let uri = self.response_open_uri(source_uri, &path)?;
+        let first = self.try_show_document(&uri, false).await;
+        if !first.0 {
+            let second = self.try_show_document(&uri, true).await;
+            if !second.0 {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!(
+                            "Response saved, but editor did not open file (uri: {uri}, try1: {}, try2: {}).",
+                            first.1, second.1
+                        ),
+                    )
+                    .await;
+            }
+        }
+
+        Ok(path.display().to_string())
+    }
+
+    fn response_output_path(
+        &self,
+        source_uri: &Url,
+        request_content_type: Option<&str>,
+    ) -> std::result::Result<PathBuf, String> {
+        let source_path = match source_uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => {
+                let uri_path = source_uri.path();
+                if uri_path.is_empty() {
+                    return Err(format!("convert source URI to file path: {source_uri}"));
+                }
+                PathBuf::from(uri_path)
+            }
+        };
+        let parent = source_path
+            .parent()
+            .ok_or_else(|| format!("determine parent directory for {}", source_path.display()))?;
+
+        let stem = source_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("response");
+        let ext = content_type_to_extension(request_content_type);
+        Ok(parent.join(format!("{stem}.response.{ext}")))
+    }
+
+    fn response_open_uri(
+        &self,
+        source_uri: &Url,
+        response_path: &std::path::Path,
+    ) -> std::result::Result<Url, String> {
+        if source_uri.scheme() == "file" {
+            return Url::from_file_path(response_path)
+                .map_err(|_| format!("convert response path to URI: {}", response_path.display()));
+        }
+
+        let mut uri = source_uri.clone();
+        let mut path = response_path.to_string_lossy().replace('\\', "/");
+        if !path.starts_with('/') {
+            path = format!("/{path}");
+        }
+        uri.set_path(&path);
+        uri.set_query(None);
+        uri.set_fragment(None);
+        Ok(uri)
+    }
+
+    async fn try_show_document(&self, uri: &Url, external: bool) -> (bool, String) {
+        let show_document = self.client.show_document(ShowDocumentParams {
+            uri: uri.clone(),
+            external: Some(external),
+            take_focus: Some(true),
+            selection: None,
+        });
+
+        match tokio::time::timeout(Duration::from_millis(1000), show_document).await {
+            Ok(Ok(true)) => (true, format!("opened(external={external})")),
+            Ok(Ok(false)) => (false, format!("declined(external={external})")),
+            Ok(Err(e)) => (false, format!("error(external={external}): {e}")),
+            Err(_) => (false, format!("timeout(external={external})")),
+        }
     }
 
     async fn refresh_settings(&self) {
@@ -301,6 +411,37 @@ impl RestClientLsp {
         self.client
             .publish_diagnostics(uri.clone(), diags, None)
             .await;
+    }
+}
+
+fn content_type_to_extension(content_type: Option<&str>) -> &'static str {
+    let Some(content_type) = content_type else {
+        return "txt";
+    };
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    match mime.as_str() {
+        "application/json" | "application/ld+json" | "application/problem+json" => "json",
+        "application/xml" | "text/xml" => "xml",
+        "text/html" => "html",
+        "text/css" => "css",
+        "text/csv" => "csv",
+        "text/plain" => "txt",
+        "application/x-www-form-urlencoded" => "txt",
+        "application/javascript" | "text/javascript" => "js",
+        "application/typescript" | "text/typescript" => "ts",
+        "application/sql" | "text/sql" => "sql",
+        "application/x-yaml" | "text/yaml" | "text/x-yaml" => "yaml",
+        "application/pdf" => "pdf",
+        _ if mime.ends_with("+json") => "json",
+        _ if mime.ends_with("+xml") => "xml",
+        _ if mime.starts_with("text/") => "txt",
+        _ => "txt",
     }
 }
 

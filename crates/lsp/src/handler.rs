@@ -31,6 +31,12 @@ impl State {
 
 pub type SharedState = Arc<RwLock<State>>;
 
+pub struct ExecuteRequestOutput {
+    pub formatted_response: String,
+    pub file_content: String,
+    pub request_content_type: Option<String>,
+}
+
 pub fn code_lenses(uri: &Url, text: &str) -> Vec<CodeLens> {
     let file = parser::parse(text);
     file.requests
@@ -261,7 +267,7 @@ pub async fn execute_request(
     uri: &Url,
     line: usize,
     state: &SharedState,
-) -> Result<String, String> {
+) -> Result<ExecuteRequestOutput, String> {
     let (text, mut ctx) = {
         let state = state.read().await;
         let text = state
@@ -297,8 +303,19 @@ pub async fn execute_request(
     let request = parser::find_request_at_line(&file, line)
         .ok_or_else(|| format!("no request found at line {line}"))?;
 
+    let request_content_type = request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.clone());
+
     let response = executor::execute(request, &ctx).await?;
     let formatted = formatter::format_response(&response);
+    let file_content = if response.status == 200 {
+        formatter::format_response_body(&response.body, &response.headers)
+    } else {
+        formatter::format_response_diagnostics(&response)
+    };
 
     // Store named response if request has a name
     if let Some(name) = &request.name {
@@ -312,5 +329,9 @@ pub async fn execute_request(
         );
     }
 
-    Ok(formatted)
+    Ok(ExecuteRequestOutput {
+        formatted_response: formatted,
+        file_content,
+        request_content_type,
+    })
 }

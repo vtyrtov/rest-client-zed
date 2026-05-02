@@ -18,13 +18,27 @@ pub fn format_response(response: &Response) -> String {
     out.push('\n');
 
     // Body
-    let body = pretty_print_body(&response.body, &response.headers);
+    let body = format_response_body(&response.body, &response.headers);
     out.push_str(&body);
 
     out
 }
 
-fn pretty_print_body(body: &str, headers: &[(String, String)]) -> String {
+pub fn format_response_diagnostics(response: &Response) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "HTTP {} {}\n",
+        response.status, response.status_text
+    ));
+    out.push_str(&format!("Time: {}ms\n", response.elapsed_ms));
+    out.push('\n');
+    for (name, value) in &response.headers {
+        out.push_str(&format!("{name}: {value}\n"));
+    }
+    out
+}
+
+pub fn format_response_body(body: &str, headers: &[(String, String)]) -> String {
     let content_type = headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
